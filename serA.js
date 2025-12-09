@@ -6,10 +6,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// -------------------
-// Utility Functions
-// -------------------
-
 // Clean domain input
 function cleanDomain(name) {
   return name.trim().toLowerCase();
@@ -29,12 +25,11 @@ function computeStatus(row) {
   return "Status Restricted";
 }
 
-// -------------------
-// Endpoint: Check Domain
-// -------------------
 app.get("/check-domain", async (req, res) => {
   const { name } = req.query;
-  if (!name) return res.status(400).json({ error: "Domain name required" });
+  if (!name) {
+    return res.status(400).json({ error: "Domain name required" });
+  }
 
   const cleanName = cleanDomain(name);
 
@@ -45,8 +40,12 @@ app.get("/check-domain", async (req, res) => {
         d.exdate,
         d.renewaldate,
         d.registrant,
+
+        -- Registrar mapping
         d.clid AS registrar_id,
         c.name AS registrar_name,
+
+        -- Status fields
         d.st_ok,
         d.st_pendingdelete,
         d.st_pendingtransfer,
@@ -64,8 +63,11 @@ app.get("/check-domain", async (req, res) => {
         d.st_sv_renewprohibited,
         d.st_sv_transferprohibited,
         d.st_sv_updateprohibited,
+
         d.createdate,
-        d.updatedate
+        d.updatedate,
+        d.signed
+
       FROM domain d
       LEFT JOIN client c ON d.clid = c.clid
       WHERE d.name = $1
@@ -74,12 +76,16 @@ app.get("/check-domain", async (req, res) => {
 
     const result = await pool.query(query, [cleanName]);
 
-    if (result.rows.length === 0) return res.json({ exists: false });
+    if (result.rows.length === 0) {
+      return res.json({ exists: false });
+    }
 
     const row = result.rows[0];
 
+    // Compute readable status
     const status = computeStatus(row);
 
+    // Group status sub-sections
     const pending = {
       delete: !!row.st_pendingdelete,
       transfer: !!row.st_pendingtransfer,
@@ -103,6 +109,7 @@ app.get("/check-domain", async (req, res) => {
       }
     };
 
+    // Return final JSON response
     res.json({
       exists: true,
       name: row.name,
@@ -115,7 +122,8 @@ app.get("/check-domain", async (req, res) => {
       pending,
       prohibited,
       created: row.createdate,
-      updated: row.updatedate
+      updated: row.updatedate,
+      signed: row.signed
     });
 
   } catch (err) {
@@ -124,94 +132,6 @@ app.get("/check-domain", async (req, res) => {
   }
 });
 
-// -------------------
-// Endpoint: Check Domains by Registrant ID
-// -------------------
-app.get("/check-registrant", async (req, res) => {
-  const { registrant_id } = req.query;
-  if (!registrant_id) return res.status(400).json({ error: "Registrant ID required" });
-
-  try {
-    const query = `
-      SELECT
-        d.name,
-        d.exdate,
-        d.renewaldate,
-        d.registrant,
-        d.clid AS registrar_id,
-        c.name AS registrar_name,
-        d.st_ok,
-        d.st_pendingdelete,
-        d.st_pendingtransfer,
-        d.st_pendingrenew,
-        d.st_pendingupdate,
-        d.st_pendingcreate,
-        d.st_inactive,
-        d.st_cl_hold,
-        d.st_sv_hold,
-        d.st_cl_deleteprohibited,
-        d.st_cl_renewprohibited,
-        d.st_cl_transferprohibited,
-        d.st_cl_updateprohibited,
-        d.st_sv_deleteprohibited,
-        d.st_sv_renewprohibited,
-        d.st_sv_transferprohibited,
-        d.st_sv_updateprohibited,
-        d.createdate,
-        d.updatedate
-      FROM domain d
-      LEFT JOIN client c ON d.clid = c.clid
-      WHERE d.registrant = $1
-      ORDER BY d.name;
-    `;
-
-    const result = await pool.query(query, [registrant_id]);
-
-    if (result.rows.length === 0) return res.json([]);
-
-    const domains = result.rows.map(row => ({
-      name: row.name,
-      registrar_id: row.registrar_id,
-      registrar_name: row.registrar_name,
-      registrant: row.registrant,
-      status: computeStatus(row),
-      expiry: row.exdate,
-      renewal: row.renewaldate,
-      pending: {
-        delete: !!row.st_pendingdelete,
-        transfer: !!row.st_pendingtransfer,
-        renew: !!row.st_pendingrenew,
-        update: !!row.st_pendingupdate,
-        create: !!row.st_pendingcreate
-      },
-      prohibited: {
-        client: {
-          delete: !!row.st_cl_deleteprohibited,
-          renew: !!row.st_cl_renewprohibited,
-          transfer: !!row.st_cl_transferprohibited,
-          update: !!row.st_cl_updateprohibited
-        },
-        server: {
-          delete: !!row.st_sv_deleteprohibited,
-          renew: !!row.st_sv_renewprohibited,
-          transfer: !!row.st_sv_transferprohibited,
-          update: !!row.st_sv_updateprohibited
-        }
-      },
-      created: row.createdate,
-      updated: row.updatedate
-    }));
-
-    res.json(domains);
-
-  } catch (err) {
-    console.error("Database error:", err);
-    res.status(500).json({ error: "Database query failed" });
-  }
-});
-
-// -------------------
-// Start Server
-// -------------------
+// Start API
 const PORT = 3000;
 app.listen(PORT, () => console.log(`API running on port ${PORT}`));
