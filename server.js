@@ -1,217 +1,213 @@
-const express = require("express");
+const { randomUUID } = require("crypto");
+
 const cors = require("cors");
+const express = require("express");
+
 const pool = require("./db");
+const { AuthError, authenticateRequest, getFirebaseApp } = require("./firebaseAdmin");
+const { DomainLookupError, lookupDomainsForAuthenticatedUser } = require("./domainLookupService");
+const { InMemoryRateLimiter, RateLimitWindow } = require("./rateLimit");
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+const getEnvInt = (name, defaultValue) => {
+  const rawValue = process.env[name];
+  if (rawValue === undefined) return defaultValue;
 
-// -------------------
-// Utility Functions
-// -------------------
+  const parsed = Number.parseInt(rawValue, 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
 
-// Clean domain input
-function cleanDomain(name) {
-  return name.trim().toLowerCase();
-}
+  return parsed;
+};
 
-// Compute user-friendly status
-function computeStatus(row) {
-  if (row.st_pendingdelete) return "Pending Delete";
-  if (row.st_cl_hold || row.st_sv_hold) return "On Hold";
-  if (row.st_pendingtransfer) return "Pending Transfer";
-  if (row.st_pendingrenew) return "Pending Renew";
-  if (row.st_pendingupdate) return "Pending Update";
-  if (row.st_pendingcreate) return "Pending Creation";
-  if (row.st_inactive) return "Inactive";
-  if (row.st_ok) return "Active";
+const getEnvBool = (name, defaultValue = false) => {
+  const rawValue = process.env[name];
+  if (rawValue === undefined) return defaultValue;
+  return ["1", "true", "yes", "on"].includes(rawValue.trim().toLowerCase());
+};
 
-  return "Status Restricted";
-}
+const sendError = (res, req, { statusCode, code, message, details, headers }) => {
+  const payload = {
+    error: {
+      code,
+      message,
+    },
+    request_id: req.requestId,
+  };
 
-// -------------------
-// Endpoint: Check Domain
-// -------------------
-app.get("/check-domain", async (req, res) => {
-  const { name } = req.query;
-  if (!name) return res.status(400).json({ error: "Domain name required" });
+  if (details) {
+    payload.error.details = details;
+  }
 
-  const cleanName = cleanDomain(name);
-
-  try {
-    const query = `
-      SELECT
-        d.name,
-        d.exdate,
-        d.renewaldate,
-        d.registrant,
-        d.clid AS registrar_id,
-        c.name AS registrar_name,
-        d.st_ok,
-        d.st_pendingdelete,
-        d.st_pendingtransfer,
-        d.st_pendingrenew,
-        d.st_pendingupdate,
-        d.st_pendingcreate,
-        d.st_inactive,
-        d.st_cl_hold,
-        d.st_sv_hold,
-        d.st_cl_deleteprohibited,
-        d.st_cl_renewprohibited,
-        d.st_cl_transferprohibited,
-        d.st_cl_updateprohibited,
-        d.st_sv_deleteprohibited,
-        d.st_sv_renewprohibited,
-        d.st_sv_transferprohibited,
-        d.st_sv_updateprohibited,
-        d.createdate,
-        d.updatedate
-      FROM domain d
-      LEFT JOIN client c ON d.clid = c.clid
-      WHERE d.name = $1
-      LIMIT 1;
-    `;
-
-    const result = await pool.query(query, [cleanName]);
-
-    if (result.rows.length === 0) return res.json({ exists: false });
-
-    const row = result.rows[0];
-
-    const status = computeStatus(row);
-
-    const pending = {
-      delete: !!row.st_pendingdelete,
-      transfer: !!row.st_pendingtransfer,
-      renew: !!row.st_pendingrenew,
-      update: !!row.st_pendingupdate,
-      create: !!row.st_pendingcreate
-    };
-
-    const prohibited = {
-      client: {
-        delete: !!row.st_cl_deleteprohibited,
-        renew: !!row.st_cl_renewprohibited,
-        transfer: !!row.st_cl_transferprohibited,
-        update: !!row.st_cl_updateprohibited
-      },
-      server: {
-        delete: !!row.st_sv_deleteprohibited,
-        renew: !!row.st_sv_renewprohibited,
-        transfer: !!row.st_sv_transferprohibited,
-        update: !!row.st_sv_updateprohibited
-      }
-    };
-
-    res.json({
-      exists: true,
-      name: row.name,
-      registrar_id: row.registrar_id,
-      registrar_name: row.registrar_name,
-      registrant: row.registrant,
-      status,
-      expiry: row.exdate,
-      renewal: row.renewaldate,
-      pending,
-      prohibited,
-      created: row.createdate,
-      updated: row.updatedate
+  if (headers) {
+    Object.entries(headers).forEach(([key, value]) => {
+      res.setHeader(key, value);
     });
-
-  } catch (err) {
-    console.error("Database error:", err);
-    res.status(500).json({ error: "Database query failed" });
   }
+
+  return res.status(statusCode).json(payload);
+};
+
+const buildRuntimeConfig = () => {
+  getFirebaseApp();
+
+  return {
+    port: getEnvInt("PORT", 3000),
+    requireProfileComplete: getEnvBool(
+      "MY_REGISTERED_REQUIRE_PROFILE_COMPLETE",
+      true
+    ),
+    limiter: new InMemoryRateLimiter({
+      windows: [
+        new RateLimitWindow({
+          limit: getEnvInt("MY_REGISTERED_BURST_LIMIT", 6),
+          windowSeconds: getEnvInt("MY_REGISTERED_BURST_WINDOW_SECONDS", 60),
+          label: "burst",
+        }),
+        new RateLimitWindow({
+          limit: getEnvInt("MY_REGISTERED_SUSTAINED_LIMIT", 30),
+          windowSeconds: getEnvInt("MY_REGISTERED_SUSTAINED_WINDOW_SECONDS", 3600),
+          label: "sustained",
+        }),
+      ],
+    }),
+  };
+};
+
+const createApp = (runtimeConfig) => {
+  const app = express();
+
+  app.set("trust proxy", 1);
+  app.use(cors());
+  app.use(express.json({ limit: "16kb" }));
+
+  app.use((req, res, next) => {
+    req.requestId = req.header("X-Request-Id")?.trim() || randomUUID();
+    res.setHeader("X-Request-Id", req.requestId);
+    res.setHeader("Cache-Control", "no-store");
+    next();
+  });
+
+  app.get("/test", (_req, res) => {
+    res.json({ message: "Server is working!" });
+  });
+
+  app.get("/health", (req, res) => {
+    res.json({
+      status: "ok",
+      service: "domain-api",
+      request_id: req.requestId,
+    });
+  });
+
+  app.post("/domains-by-phone", async (req, res) => {
+    try {
+      if (!req.is("application/json")) {
+        return sendError(res, req, {
+          statusCode: 415,
+          code: "INVALID_CONTENT_TYPE",
+          message: "Requests must use application/json.",
+        });
+      }
+
+      const authContext = await authenticateRequest(req, {
+        requireProfileComplete: runtimeConfig.requireProfileComplete,
+      });
+
+      const rateLimit = runtimeConfig.limiter.check({
+        userKey: authContext.uid,
+        clientKey: req.ip,
+      });
+
+      if (!rateLimit.allowed) {
+        return sendError(res, req, {
+          statusCode: 429,
+          code: "RATE_LIMIT_EXCEEDED",
+          message:
+            "You've reached your current lookup quota. Please try again after the reset period.",
+          details: { retry_after_seconds: rateLimit.retryAfterSeconds },
+          headers: rateLimit.headers,
+        });
+      }
+
+      if (
+        req.body !== undefined &&
+        (req.body === null || Array.isArray(req.body) || typeof req.body !== "object")
+      ) {
+        return sendError(res, req, {
+          statusCode: 400,
+          code: "INVALID_JSON_BODY",
+          message: "Request body must be a JSON object.",
+          headers: rateLimit.headers,
+        });
+      }
+
+      const data = await lookupDomainsForAuthenticatedUser({
+        pool,
+        profile: authContext.profile,
+        claims: authContext.claims,
+      });
+
+      Object.entries(rateLimit.headers).forEach(([key, value]) => {
+        res.setHeader(key, value);
+      });
+
+      return res.json({
+        data,
+        request_id: req.requestId,
+      });
+    } catch (error) {
+      if (error instanceof AuthError || error instanceof DomainLookupError) {
+        return sendError(res, req, {
+          statusCode: error.statusCode,
+          code: error.code,
+          message: error.message,
+          details: error.details,
+        });
+      }
+
+      console.error("domains-by-phone failure", {
+        requestId: req.requestId,
+        error,
+      });
+
+      return sendError(res, req, {
+        statusCode: 500,
+        code: "INTERNAL_SERVER_ERROR",
+        message: "This service is unavailable right now. Please try again shortly.",
+      });
+    }
+  });
+
+  app.use((error, req, res, next) => {
+    if (error?.type === "entity.parse.failed") {
+      return sendError(res, req, {
+        statusCode: 400,
+        code: "INVALID_JSON_BODY",
+        message: "Request body must contain valid JSON.",
+      });
+    }
+
+    return next(error);
+  });
+
+  return app;
+};
+
+pool.on("error", (error) => {
+  console.error("postgres pool error", error);
 });
 
-// -------------------
-// Endpoint: Check Domains by Registrant ID
-// -------------------
-app.get("/check-registrant", async (req, res) => {
-  const { registrant_id } = req.query;
-  if (!registrant_id) return res.status(400).json({ error: "Registrant ID required" });
+const runtimeConfig = buildRuntimeConfig();
+const app = createApp(runtimeConfig);
 
-  try {
-    const query = `
-      SELECT
-        d.name,
-        d.exdate,
-        d.renewaldate,
-        d.registrant,
-        d.clid AS registrar_id,
-        c.name AS registrar_name,
-        d.st_ok,
-        d.st_pendingdelete,
-        d.st_pendingtransfer,
-        d.st_pendingrenew,
-        d.st_pendingupdate,
-        d.st_pendingcreate,
-        d.st_inactive,
-        d.st_cl_hold,
-        d.st_sv_hold,
-        d.st_cl_deleteprohibited,
-        d.st_cl_renewprohibited,
-        d.st_cl_transferprohibited,
-        d.st_cl_updateprohibited,
-        d.st_sv_deleteprohibited,
-        d.st_sv_renewprohibited,
-        d.st_sv_transferprohibited,
-        d.st_sv_updateprohibited,
-        d.createdate,
-        d.updatedate
-      FROM domain d
-      LEFT JOIN client c ON d.clid = c.clid
-      WHERE d.registrant = $1
-      ORDER BY d.name;
-    `;
-
-    const result = await pool.query(query, [registrant_id]);
-
-    if (result.rows.length === 0) return res.json([]);
-
-    const domains = result.rows.map(row => ({
-      name: row.name,
-      registrar_id: row.registrar_id,
-      registrar_name: row.registrar_name,
-      registrant: row.registrant,
-      status: computeStatus(row),
-      expiry: row.exdate,
-      renewal: row.renewaldate,
-      pending: {
-        delete: !!row.st_pendingdelete,
-        transfer: !!row.st_pendingtransfer,
-        renew: !!row.st_pendingrenew,
-        update: !!row.st_pendingupdate,
-        create: !!row.st_pendingcreate
-      },
-      prohibited: {
-        client: {
-          delete: !!row.st_cl_deleteprohibited,
-          renew: !!row.st_cl_renewprohibited,
-          transfer: !!row.st_cl_transferprohibited,
-          update: !!row.st_cl_updateprohibited
-        },
-        server: {
-          delete: !!row.st_sv_deleteprohibited,
-          renew: !!row.st_sv_renewprohibited,
-          transfer: !!row.st_sv_transferprohibited,
-          update: !!row.st_sv_updateprohibited
-        }
-      },
-      created: row.createdate,
-      updated: row.updatedate
-    }));
-
-    res.json(domains);
-
-  } catch (err) {
-    console.error("Database error:", err);
-    res.status(500).json({ error: "Database query failed" });
-  }
+app.listen(runtimeConfig.port, () => {
+  console.log(`Server running on port ${runtimeConfig.port}`);
 });
 
-// -------------------
-// Start Server
-// -------------------
-const PORT = 3000;
-app.listen(PORT, () => console.log(`API running on port ${PORT}`));
+module.exports = {
+  app,
+  buildRuntimeConfig,
+  createApp,
+  sendError,
+};
