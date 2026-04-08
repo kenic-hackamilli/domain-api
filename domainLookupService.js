@@ -1,3 +1,5 @@
+const { logInfo, logWarn } = require("./logger");
+
 class DomainLookupError extends Error {
   constructor({ code, message, statusCode, details }) {
     super(message);
@@ -53,12 +55,20 @@ const buildPhoneCandidates = (value) => {
   return [...candidates].filter(Boolean);
 };
 
-const resolveLookupPhone = ({ profile, claims }) => {
-  const profilePhone =
-    profile?.phone || profile?.phoneNumber || claims?.phone_number || "";
+const getProfilePhone = ({ profile, claims }) =>
+  profile?.phone || profile?.phoneNumber || claims?.phone_number || "";
+
+const resolveLookupPhone = ({ profile, claims, requestId, userId }) => {
+  const profilePhone = getProfilePhone({ profile, claims });
   const normalized = normalizeKenyanPhone(profilePhone);
 
   if (!normalized) {
+    logWarn("domain_lookup_phone_missing", {
+      requestId,
+      userId,
+      profilePhone: String(profilePhone || "").trim(),
+    });
+
     throw new DomainLookupError({
       code: "PROFILE_PHONE_MISSING",
       message: "Add a phone number to your profile to view registered domains.",
@@ -91,17 +101,27 @@ const normalizeExpiry = (value) => {
   return String(value);
 };
 
-const lookupDomainsForAuthenticatedUser = async ({ pool, profile, claims }) => {
-  const { displayPhone, candidates } = resolveLookupPhone({ profile, claims });
+const lookupDomainsForAuthenticatedUser = async ({
+  pool,
+  profile,
+  claims,
+  requestId,
+  userId,
+}) => {
+  const { displayPhone, candidates } = resolveLookupPhone({
+    profile,
+    claims,
+    requestId,
+    userId,
+  });
 
-  if (candidates.length === 0) {
-    throw new DomainLookupError({
-      code: "PROFILE_PHONE_INVALID",
-      message:
-        "We couldn't use the phone number on your profile. Update it and try again.",
-      statusCode: 400,
-    });
-  }
+  logInfo("domain_lookup_started", {
+    requestId,
+    userId,
+    lookupPhone: displayPhone,
+    lookupCandidates: candidates,
+    candidateCount: candidates.length,
+  });
 
   const query = `
     SELECT
@@ -151,9 +171,19 @@ const lookupDomainsForAuthenticatedUser = async ({ pool, profile, claims }) => {
     });
   });
 
+  const domains = [...domainMap.values()];
+
+  logInfo("domain_lookup_completed", {
+    requestId,
+    userId,
+    lookupPhone: displayPhone,
+    matchedRowCount: rows.length,
+    domainCount: domains.length,
+  });
+
   return {
     phone: displayPhone,
-    domains: [...domainMap.values()],
+    domains,
   };
 };
 

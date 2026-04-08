@@ -1,3 +1,5 @@
+require("./env");
+
 const { randomUUID } = require("crypto");
 
 const cors = require("cors");
@@ -6,6 +8,7 @@ const express = require("express");
 const pool = require("./db");
 const { AuthError, authenticateRequest, getFirebaseApp } = require("./firebaseAdmin");
 const { DomainLookupError, lookupDomainsForAuthenticatedUser } = require("./domainLookupService");
+const { logError, logInfo, logWarn, serializeError } = require("./logger");
 const { InMemoryRateLimiter, RateLimitWindow } = require("./rateLimit");
 
 const getEnvInt = (name, defaultValue) => {
@@ -101,8 +104,16 @@ const createApp = (runtimeConfig) => {
   });
 
   app.post("/domains-by-phone", async (req, res) => {
+    let authContext;
+
     try {
       if (!req.is("application/json")) {
+        logWarn("domains_by_phone_invalid_content_type", {
+          requestId: req.requestId,
+          clientIp: req.ip,
+          contentType: req.header("Content-Type") || "",
+        });
+
         return sendError(res, req, {
           statusCode: 415,
           code: "INVALID_CONTENT_TYPE",
@@ -110,7 +121,7 @@ const createApp = (runtimeConfig) => {
         });
       }
 
-      const authContext = await authenticateRequest(req, {
+      authContext = await authenticateRequest(req, {
         requireProfileComplete: runtimeConfig.requireProfileComplete,
       });
 
@@ -120,6 +131,13 @@ const createApp = (runtimeConfig) => {
       });
 
       if (!rateLimit.allowed) {
+        logWarn("domains_by_phone_rate_limited", {
+          requestId: req.requestId,
+          userId: authContext.uid,
+          clientIp: req.ip,
+          retryAfterSeconds: rateLimit.retryAfterSeconds,
+        });
+
         return sendError(res, req, {
           statusCode: 429,
           code: "RATE_LIMIT_EXCEEDED",
@@ -134,6 +152,13 @@ const createApp = (runtimeConfig) => {
         req.body !== undefined &&
         (req.body === null || Array.isArray(req.body) || typeof req.body !== "object")
       ) {
+        logWarn("domains_by_phone_invalid_body", {
+          requestId: req.requestId,
+          userId: authContext.uid,
+          clientIp: req.ip,
+          bodyType: req.body === null ? "null" : typeof req.body,
+        });
+
         return sendError(res, req, {
           statusCode: 400,
           code: "INVALID_JSON_BODY",
@@ -146,10 +171,20 @@ const createApp = (runtimeConfig) => {
         pool,
         profile: authContext.profile,
         claims: authContext.claims,
+        requestId: req.requestId,
+        userId: authContext.uid,
       });
 
       Object.entries(rateLimit.headers).forEach(([key, value]) => {
         res.setHeader(key, value);
+      });
+
+      logInfo("domains_by_phone_succeeded", {
+        requestId: req.requestId,
+        userId: authContext.uid,
+        clientIp: req.ip,
+        lookupPhone: data.phone,
+        domainCount: data.domains.length,
       });
 
       return res.json({
@@ -158,6 +193,13 @@ const createApp = (runtimeConfig) => {
       });
     } catch (error) {
       if (error instanceof AuthError || error instanceof DomainLookupError) {
+        logWarn("domains_by_phone_failed", {
+          requestId: req.requestId,
+          userId: authContext?.uid,
+          clientIp: req.ip,
+          error: serializeError(error, { includeStack: false }),
+        });
+
         return sendError(res, req, {
           statusCode: error.statusCode,
           code: error.code,
@@ -166,9 +208,11 @@ const createApp = (runtimeConfig) => {
         });
       }
 
-      console.error("domains-by-phone failure", {
+      logError("domains_by_phone_unexpected_failure", {
         requestId: req.requestId,
-        error,
+        userId: authContext?.uid,
+        clientIp: req.ip,
+        error: serializeError(error),
       });
 
       return sendError(res, req, {
@@ -181,6 +225,11 @@ const createApp = (runtimeConfig) => {
 
   app.use((error, req, res, next) => {
     if (error?.type === "entity.parse.failed") {
+      logWarn("domains_by_phone_invalid_json", {
+        requestId: req.requestId,
+        clientIp: req.ip,
+      });
+
       return sendError(res, req, {
         statusCode: 400,
         code: "INVALID_JSON_BODY",
@@ -195,14 +244,18 @@ const createApp = (runtimeConfig) => {
 };
 
 pool.on("error", (error) => {
-  console.error("postgres pool error", error);
+  logError("postgres_pool_error", {
+    error: serializeError(error),
+  });
 });
 
 const runtimeConfig = buildRuntimeConfig();
 const app = createApp(runtimeConfig);
 
 app.listen(runtimeConfig.port, () => {
-  console.log(`Server running on port ${runtimeConfig.port}`);
+  logInfo("server_started", {
+    port: runtimeConfig.port,
+  });
 });
 
 module.exports = {

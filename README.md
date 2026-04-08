@@ -36,6 +36,9 @@ MY_REGISTERED_SUSTAINED_LIMIT=30
 MY_REGISTERED_SUSTAINED_WINDOW_SECONDS=3600
 ```
 
+The server reads its environment from `domain-api/.env`, so you can change
+`PORT` there without editing the code.
+
 ## First-Time Server Setup
 
 ```bash
@@ -93,3 +96,5 @@ curl -X POST http://127.0.0.1:3000/domains-by-phone \
 - By default, `profileComplete` must be `true` unless you set
   `MY_REGISTERED_REQUIRE_PROFILE_COMPLETE=false`.
 - Rate limiting is enforced server-side even if the client is modified.
+- The API writes structured JSON logs, including lookup phone numbers,
+  request IDs, result counts, and failure details for `/domains-by-phone`.
